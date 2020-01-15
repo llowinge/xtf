@@ -1,6 +1,7 @@
 package cz.xtf.core.openshift;
 
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.SystemUtils;
 
@@ -197,7 +198,29 @@ public class OpenShifts {
 	}
 
 	public static String getVersion() {
-		String content = Https.httpsGetContent(OpenShiftConfig.url() + "/version/openshift");
+		String content = Https.httpsGetContent(OpenShiftConfig.url() + "/version");
+
+		HttpsURLConnection connection = null;
+		try {
+			connection = Https.getHttpsConnection(new URL(OpenShiftConfig.url() + "/apis/config.openshift.io/v1/clusterversions/version"));
+			connection.setRequestProperty("Authorization", "Bearer " +getAdminToken());
+			connection.setInstanceFollowRedirects(false);
+
+			connection.connect();
+			String message = IOUtils.toString(connection.getInputStream());
+			connection.disconnect();
+
+			System.out.println(message);
+//			List<String> location = headers.get("Location");
+//			if (location != null) {
+//				Optional<String> acces_token = location.stream().filter(s -> s.contains("access_token")).findFirst();
+//				return acces_token.map(s -> StringUtils.substringBetween(s, "#access_token=", "&")).orElse(null);
+//			}
+		} catch (IOException ex) {
+			log.error("Unable to retrieve token from Location header: {} ", ex.getMessage());
+		} finally {
+			if (connection != null) connection.disconnect();
+		}
 		return ModelNode.fromJSONString(content).get("gitVersion").asString().replaceAll("^v(.*)", "$1");
 	}
 
