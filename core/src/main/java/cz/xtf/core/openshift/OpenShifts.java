@@ -1,6 +1,7 @@
 package cz.xtf.core.openshift;
 
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.SystemUtils;
 
@@ -29,7 +30,8 @@ import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class OpenShifts {
-	private static final String CLIENTS_URL = "https://mirror.openshift.com/pub/openshift-v3/clients/";
+	private static final String OCP3_CLIENTS_URL = "https://mirror.openshift.com/pub/openshift-v3/clients/";
+	private static final String OCP4_CLIENTS_URL = "https://mirror.openshift.com/pub/openshift-v4/clients/oc/";
 
 	private static OpenShift adminUtil;
 	private static OpenShift masterUtil;
@@ -37,7 +39,7 @@ public class OpenShifts {
 	private static String openShiftBinaryPath;
 
 	public static OpenShift admin() {
-		if(adminUtil == null) {
+		if (adminUtil == null) {
 			adminUtil = OpenShifts.admin(OpenShiftConfig.namespace());
 		}
 		return adminUtil;
@@ -60,7 +62,7 @@ public class OpenShifts {
 	}
 
 	public static OpenShift master() {
-		if(masterUtil == null) {
+		if (masterUtil == null) {
 			masterUtil = OpenShifts.master(OpenShiftConfig.namespace());
 		}
 		return masterUtil;
@@ -83,10 +85,10 @@ public class OpenShifts {
 	}
 
 	public static String getBinaryPath() {
-		if(openShiftBinaryPath == null) {
+		if (openShiftBinaryPath == null) {
 			if (OpenShiftConfig.binaryPath() != null) {
 				openShiftBinaryPath = OpenShiftConfig.binaryPath();
-			} else if (OpenShiftConfig.version() != null) {
+			} else if (StringUtils.isNotEmpty(OpenShiftConfig.version())) {
 				openShiftBinaryPath = OpenShifts.downloadOpenShiftBinary(OpenShiftConfig.version());
 			} else {
 				openShiftBinaryPath = OpenShifts.downloadOpenShiftBinary(OpenShifts.getVersion());
@@ -123,8 +125,7 @@ public class OpenShifts {
 			} else {
 				openShiftBinary.login(OpenShiftConfig.url(), username, password);
 			}
-		}
-		else {
+		} else {
 			// If we are using an existing kubeconfig (or a default kubeconfig), we copy the original kubeconfig
 			if (StringUtils.isNotEmpty(kubeconfig)) {
 				// We copy the specified kubeconfig
@@ -169,11 +170,35 @@ public class OpenShifts {
 
 	private static String downloadOpenShiftBinary(String version) {
 		String systemType = SystemUtils.IS_OS_MAC ? "macosx" : "linux";
-		String clientLocation = String.format(CLIENTS_URL + "%s/%s/", version, systemType);
+		String clientLocation = null;
+		String ocFileName = "oc.tar.gz";
 
+		if (version.startsWith("3")) {
+			clientLocation = String.format(OCP3_CLIENTS_URL + "%s/%s/", version, systemType);
+		} else {
+			if (StringUtils.isNotEmpty(OpenShiftConfig.version())) {
+				clientLocation = String.format(OCP4_CLIENTS_URL + "%s/%s/", version, systemType);
+			} else {
+				if (SystemUtils.IS_OS_MAC) {
+					systemType = "mac";
+					ocFileName = "oc.zip";
+				} else {
+					systemType = "linux";
+					ocFileName = "oc.tar";
+				}
+				final Optional<ModelNode> downloadsNodeOptional = apiResources("route.openshift.io/v1/routes").get("items").asList().stream().filter(m -> "downloads".equals(m.get("metadata").get("name").asString())).findAny();
+				final ModelNode downloads = downloadsNodeOptional.orElseThrow(() -> new IllegalStateException("We are not able to figure out Openshift version."));
+				clientLocation = String.format("https://" + downloads.get("spec").get("host").asString() + "/amd64/%s/", systemType);
+				return downloadOpenShiftBinaryInternal(version, ocFileName, clientLocation, true);
+			}
+		}
+		return downloadOpenShiftBinaryInternal(version, ocFileName, clientLocation, false);
+	}
+
+	private static String downloadOpenShiftBinaryInternal(final String version, final String ocFileName, final String clientLocation, final boolean trustAll) {
 		int code = Https.httpsGetCode(clientLocation);
 
-		if(code != 200) {
+		if (code != 200) {
 			throw new IllegalStateException("Client binary for version " + version + " isn't available at " + clientLocation);
 		}
 
@@ -183,22 +208,53 @@ public class OpenShifts {
 		File ocTarFile = new File(workdir, "oc.tar.gz");
 		File ocFile = new File(workdir, "oc");
 
+		final String ocUrl = clientLocation + ocFileName;
 		try {
-			URL requestUrl = new URL(clientLocation + "oc.tar.gz");
-			FileUtils.copyURLToFile(requestUrl, ocTarFile, 20_000, 300_000);
+			URL requestUrl = new URL(ocUrl);
+
+			if (trustAll) {
+				Https.copyHttpsURLToFile(requestUrl, ocTarFile, 20_000, 300_000);
+			} else {
+				FileUtils.copyURLToFile(requestUrl, ocTarFile, 20_000, 300_000);
+			}
 
 			executeCommand("tar", "-xf", ocTarFile.getPath(), "-C", workdir.getPath());
 			FileUtils.deleteQuietly(ocTarFile);
 
 			return ocFile.getAbsolutePath();
 		} catch (IOException | InterruptedException e) {
-			throw new IllegalStateException("Failed to download and extract oc binary from " + clientLocation + "oc.tar.gz", e);
+			throw new IllegalStateException("Failed to download and extract oc binary from " + ocUrl, e);
 		}
 	}
 
 	public static String getVersion() {
-		String content = Https.httpsGetContent(OpenShiftConfig.url() + "/version/openshift");
-		return ModelNode.fromJSONString(content).get("gitVersion").asString().replaceAll("^v(.*)", "$1");
+		final String ocp3UrlVersion = OpenShiftConfig.url() + "/version/openshift";
+		if (Https.getCode(ocp3UrlVersion) == 200) { // for OCP 3
+			String content = Https.httpsGetContent(ocp3UrlVersion);
+			return ModelNode.fromJSONString(content).get("gitVersion").asString().replaceAll("^v(.*)", "$1");
+		} else { // for OCP version > 3
+			return apiResources("config.openshift.io/v1/clusterversions/version").get("status").get("desired").get("version").asString();
+		}
+	}
+
+	private static ModelNode apiResources(final String apiRequest) {
+		HttpsURLConnection connection = null;
+		try {
+			connection = Https.getHttpsConnection(new URL(OpenShiftConfig.url() + "/apis/" + apiRequest));
+			connection.setRequestProperty("Authorization", "Bearer " + getMasterToken());
+			connection.setInstanceFollowRedirects(false);
+
+			connection.connect();
+			final String message = IOUtils.toString(connection.getInputStream(), StandardCharsets.UTF_8);
+			connection.disconnect();
+
+			return ModelNode.fromJSONString(message);
+		} catch (IOException ex) {
+			log.error("Unable to retrieve clusterversions", ex);
+		} finally {
+			if (connection != null) connection.disconnect();
+		}
+		throw new IllegalStateException("We are not able to request api " + apiRequest);
 	}
 
 	public static String getMasterToken() {
@@ -268,7 +324,7 @@ public class OpenShifts {
 
 		int result = pb.start().waitFor();
 
-		if(result != 0) {
+		if (result != 0) {
 			throw new IOException("Failed to execute: " + Arrays.toString(args));
 		}
 	}
